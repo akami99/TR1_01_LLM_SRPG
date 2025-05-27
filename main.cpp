@@ -1,3 +1,5 @@
+#define NOMINMAX // min, maxを使う時にWindowsの定義を無効化する
+
 #include <Windows.h>
 #include <cstdint>
 #include <string>
@@ -13,6 +15,11 @@
 #include <dxgidebug.h>
 #include <dxcapi.h>
 #include <vector>
+
+#include <cmath>
+#include <queue>
+#include <set>
+#include <tuple>
 
 #include "externals/DirectXTex/DirectXTex.h"
 #include "externals/DirectXTex/d3dx12.h"
@@ -408,6 +415,279 @@ ID3D12Resource* CreateDepthStencilTextureResource(ID3D12Device* device, int32_t 
 	return resource;
 }
 
+///----------------------------------------------------------------------------
+/// TR1_LLM_SRPG用の設定
+///----------------------------------------------------------------------------
+
+// ------------------------
+// マップとユニット情報
+// ------------------------
+constexpr int TILE_SIZE = 32; // タイルのサイズ
+constexpr int MAP_SIZE = 16;  // マップのサイズ(16x16)
+
+// タイルの種類
+enum TileType {
+	PLAIN = 0,  // 平地
+	FOREST = 1  // 森
+};
+
+// ターンのフェーズ
+enum Phase {
+	PlayerTurn, // プレイヤーターン
+	EnemyTurn   // エネミーターン
+};
+Phase current_phase = PlayerTurn; // 現在のフェーズ(開始時はプレイヤーターン)
+
+// マップの定義
+int map[MAP_SIZE][MAP_SIZE] = {
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0},
+	{0,0,0,0,0,1,1,0,1,0,1,0,0,0,0,0},
+	{0,0,0,0,0,1,0,1,0,1,1,0,0,0,0,0},
+	{0,0,0,0,0,1,0,0,0,0,1,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+};
+
+// ユニット情報
+struct Unit {
+	std::string name;          // ユニット名
+	int x, y;                  // 位置
+	bool is_enemy;             // 敵かどうか
+	int hp;                    // hp
+	int move = 3;              // 移動力
+	bool has_moved = false;    // 移動済みかどうか
+	bool has_attacked = false; // 攻撃済みかどうか
+	int min_range = 1;         // 最小攻撃範囲
+	int max_range = 1;         // 最大攻撃範囲
+	int atk = 5;               // 攻撃力
+	int def = 2;               // 防御力
+};
+
+// ユニットの初期化
+std::vector<Unit> units = {
+	{"ally1", 5, 5, false, 20, 3},  // 味方ユニット
+	{"enemy1", 10, 5, true, 15, 3}  // 敵ユニット
+};
+
+int selected_unit_index = -1;  // 選択中のユニットインデックス
+std::set<std::pair<int, int>> current_move_range; // 現在の移動可能範囲(ユニットの移動力に基づく)
+std::set<std::pair<int, int>> current_attack_range; // 現在の攻撃可能範囲(ユニットの攻撃範囲に基づく)
+
+// ------------------------
+// ImGui関数
+// ------------------------
+
+// マップのサイズとタイルのサイズを基に、ウィンドウのクライアント領域を設定
+bool is_within_bounds(int x, int y) {
+	return x >= 0 && y >= 0 && x < MAP_SIZE && y < MAP_SIZE;
+}
+
+// タイルが進行可能かどうかを判定する関数
+bool is_tile_passable(int x, int y) {
+	return map[y][x] != FOREST; // 森を通れない
+}
+
+// ユニットがその位置にいるかどうかを判定する関数
+bool is_occupied(int x, int y) {
+	for (const auto& u : units) {
+		if (u.hp > 0 && u.x == x && u.y == y) return true;
+	}
+	return false;
+}
+
+// ユニットの移動範囲を計算する関数
+std::set<std::pair<int, int>> get_move_range(const Unit& unit) {
+	std::set<std::pair<int, int>> result;
+	std::queue<std::tuple<int, int, int>> q;
+	q.push({ unit.x, unit.y, 0 });
+
+	while (!q.empty()) {
+		auto [x, y, d] = q.front(); q.pop();
+		if (d > unit.move) continue;
+		if (!is_within_bounds(x, y) || !is_tile_passable(x, y)) continue;
+		if (result.count({ x, y })) continue;
+		result.insert({ x, y });
+
+		q.push({ x + 1, y, d + 1 });
+		q.push({ x - 1, y, d + 1 });
+		q.push({ x, y + 1, d + 1 });
+		q.push({ x, y - 1, d + 1 });
+	}
+	return result;
+}
+
+// ユニットの攻撃範囲を計算する関数
+std::set<std::pair<int, int>> get_attack_range(const Unit& unit) {
+	std::set<std::pair<int, int>> result;
+	for (int dx = -unit.max_range; dx <= unit.max_range; ++dx) {
+		for (int dy = -unit.max_range; dy <= unit.max_range; ++dy) {
+			int dist = abs(dx) + abs(dy);
+			if (dist >= unit.min_range && dist <= unit.max_range) {
+				int tx = unit.x + dx;
+				int ty = unit.y + dy;
+				if (is_within_bounds(tx, ty)) {
+					result.insert({ tx, ty });
+				}
+			}
+		}
+	}
+	return result;
+}
+
+// ユニットを攻撃する関数
+void attack(Unit& attacker, Unit& target) {
+	int damage = std::max(0, attacker.atk - target.def);
+	target.hp -= damage;
+	// 反撃処理
+	if (target.hp > 0) {
+		auto counter_range = get_attack_range(target);
+		if (counter_range.count({ attacker.x, attacker.y })) {
+			int counter = std::max(0, target.atk - attacker.def);
+			attacker.hp -= counter;
+		}
+	}
+}
+
+// プレイヤーターンを終了する関数
+void end_player_turn() {
+	for (auto& u : units) {
+		if (!u.is_enemy) {
+			u.has_moved = false;
+			u.has_attacked = false;
+		}
+	}
+	current_phase = EnemyTurn;
+}
+
+// エネミーターンのロジック
+void enemy_turn_logic() {
+	for (auto& enemy : units) {
+		if (!enemy.is_enemy || enemy.hp <= 0) continue;
+		for (auto& target : units) {
+			if (target.is_enemy || target.hp <= 0) continue;
+			int dx = abs(enemy.x - target.x);
+			int dy = abs(enemy.y - target.y);
+			if (dx + dy == 1) {
+				attack(enemy, target);
+				break;
+			}
+		}
+	}
+	for (auto& u : units) u.has_moved = u.has_attacked = false;
+	current_phase = PlayerTurn;
+}
+
+// マップとユニットを描画する関数
+void RenderMapWithUnits() {
+	ImGui::Begin("Tactics Map");
+
+	ImDrawList* draw_list = ImGui::GetWindowDrawList(); // 描画リストを取得
+	ImVec2 origin = ImGui::GetCursorScreenPos();        // カーソルの位置を取得
+
+	// マップの描画
+	for (int y = 0; y < MAP_SIZE; ++y) {
+		for (int x = 0; x < MAP_SIZE; ++x) {
+			ImU32 color = (map[y][x] == 0) ? IM_COL32(200, 200, 200, 255) : IM_COL32(100, 200, 100, 255); // 平地と森の色
+			// マスの移動可能範囲
+			if (current_move_range.count({ x, y })) color = IM_COL32(100, 100, 255, 180);
+			// マスの攻撃可能範囲
+			if (current_attack_range.count({ x, y })) color = IM_COL32(255, 100, 100, 180);
+			ImVec2 tl = { origin.x + x * TILE_SIZE, origin.y + y * TILE_SIZE };
+			ImVec2 br = { tl.x + TILE_SIZE, tl.y + TILE_SIZE };
+			draw_list->AddRectFilled(tl, br, color);
+			draw_list->AddRect(tl, br, IM_COL32(0, 0, 0, 255));
+		}
+	}
+
+	// ユニットの描画
+	for (size_t i = 0; i < units.size(); ++i) {
+		const auto& u = units[i];
+		if (u.hp <= 0) continue; // HPが0のユニットは描画しない
+		ImVec2 tl = { origin.x + u.x * TILE_SIZE, origin.y + u.y * TILE_SIZE };
+		ImVec2 br = { tl.x + TILE_SIZE, tl.y + TILE_SIZE };
+		ImU32 color = u.is_enemy ? IM_COL32(255, 50, 50, 255) : IM_COL32(50, 50, 255, 255);
+		draw_list->AddRectFilled(tl, br, color);
+		if ((int)i == selected_unit_index) draw_list->AddRect(tl, br, IM_COL32(255, 255, 0, 255), 0.0f, 0, 3.0f);
+	}
+
+	// マスクリック処理
+	ImVec2 mouse = ImGui::GetMousePos();
+	if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) {
+		int mx = (int)((mouse.x - origin.x) / TILE_SIZE);
+		int my = (int)((mouse.y - origin.y) / TILE_SIZE);
+		
+		// 既にユニットが選択されていて、移動範囲内なら移動処理
+		if (selected_unit_index >= 0 && selected_unit_index < (int)units.size()) {
+			auto& u = units[selected_unit_index];
+			if (!u.has_moved && current_move_range.count({ mx, my }) && !is_occupied(mx, my)) {
+				u.x = mx;
+				u.y = my;
+				u.has_moved = true;
+				current_move_range.clear();
+				current_attack_range = get_attack_range(u);
+			} else if (!u.has_attacked && current_attack_range.count({ mx, my })) {
+				// 攻撃処理
+				for (auto& target : units) {
+					if (target.is_enemy && target.hp > 0 && target.x == mx && target.y == my) {
+						attack(u, target);
+						u.has_attacked = true;
+						break;
+					}
+				}
+			}
+		}
+
+		// ユニット選択
+		for (size_t i = 0; i < units.size(); ++i) {
+			if (units[i].x == mx && units[i].y == my && !units[i].is_enemy) {
+				selected_unit_index = (int)i;
+				current_move_range = get_move_range(units[i]);
+			}
+		}
+	}
+
+	ImGui::Dummy(ImVec2(MAP_SIZE * TILE_SIZE, MAP_SIZE * TILE_SIZE));
+	ImGui::End();
+}
+
+// ユニットパネルを描画する関数
+void RenderUnitPanel() {
+	ImGui::Begin("Unit Info");
+	if (selected_unit_index >= 0 && selected_unit_index < (int)units.size()) {
+		auto& u = units[selected_unit_index];
+		ImGui::Text("%s", u.name.c_str());
+		ImGui::Text("Position: (%d, %d)", u.x, u.y);
+		ImGui::Text("HP: %d", u.hp);
+		ImGui::Text("ATK: %d / DEF: %d", u.atk, u.def);
+		ImGui::Text("Moved: %s", u.has_moved ? "Yes" : "No");
+		ImGui::Text("Attacked: %s", u.has_attacked ? "Yes" : "No");
+	} else {
+		ImGui::Text("Please Select");
+	}
+	if (current_phase == PlayerTurn && ImGui::Button("Turn End")) {
+		end_player_turn();
+	}
+	ImGui::End();
+}
+
+// UIを描画する関数
+void RenderUI() {
+	if (current_phase == EnemyTurn) enemy_turn_logic();
+	RenderMapWithUnits();
+	RenderUnitPanel();
+}
+
+///----------------------------------------------------------------------------
 
 // Windowsアプリでのエントリーポイント(main関数)
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
@@ -922,9 +1202,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 
 		srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
 
-
-
-
+	
 	
 
 
@@ -944,9 +1222,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			// 開発用UIの処理。実際に開発用のUIを出す場合はここをゲーム固有の処理に置き換える
 			//ImGui::ShowDemoWindow();
 
+			///----------------------------------------------------------------------------
+            /// TR1_LLM_SRPG用の設定
+            ///----------------------------------------------------------------------------
+
+			RenderUI();
+
+			///----------------------------------------------------------------------------
+
 			// ゲームの処理-----------------------------------------------------------------------------------
 
-			transform.rotate.y += 0.01f;
+			
 
 			Transform cameraTransform = { { 1.0f, 1.0f, 1.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -5.0f } };
 			Matrix4x4 worldMatrix = MakeAffineMatrix(transform.scale, transform.rotate, transform.translate);
