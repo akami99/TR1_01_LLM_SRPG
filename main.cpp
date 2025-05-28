@@ -646,9 +646,7 @@ void enemy_turn_logic() {
 			// 移動先の候補地を評価
 			for (const auto& move_pos : possible_moves) {
 				// 移動後の位置から攻撃できる敵を探す
-				// 注意: ここでenemyのx,yを一時的に変更してget_attack_rangeを呼ぶか、
-				// get_attack_rangeに引数として位置を渡せるように変更する必要がある
-				// 今回は簡略化のため、直接マンハッタン距離で判定
+				// マンハッタン距離で判定
 
 				for (auto& ally : units) {
 					if (ally.is_enemy || ally.hp <= 0) continue;
@@ -676,8 +674,8 @@ void enemy_turn_logic() {
 				enemy.y = best_move_y;
 				attack(enemy, *best_attack_target);
 			} else {
-				// 攻撃可能な場所が見つからなかった場合、ターゲットに近づく (既存のロジックを改良)
-				// 例えば、ターゲットまでの距離が最も短くなる1マス移動先を探す
+				// 攻撃可能な場所が見つからなかった場合、ターゲットに近づく
+				// ターゲットまでの距離が最も短くなる1マス移動先を探す
 				int current_dist_to_target = std::abs(enemy.x - target_unit->x) + std::abs(enemy.y - target_unit->y);
 				int best_approach_x = enemy.x;
 				int best_approach_y = enemy.y;
