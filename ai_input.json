@@ -1,0 +1,1 @@
+{"allies":[{"atk":5,"hp":20,"id":"ally1","range":[1,1],"x":7,"y":5}],"enemies":[{"atk":5,"hp":15,"id":"enemy1","range":[2,2],"x":10,"y":5}]}

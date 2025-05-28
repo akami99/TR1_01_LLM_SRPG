@@ -16,10 +16,23 @@
 #include <dxcapi.h>
 #include <vector>
 
+// SRPG用--------------------------
 #include <cmath>
 #include <queue>
 #include <set>
 #include <tuple>
+#include <limits>
+//---------------------------------
+
+// Ollama用-------------------------
+#include <sstream>
+#include <cstdlib>
+#include <cstdio>
+#include "externals/nlohmann/json.hpp"  // JSONパーサ（https://github.com/nlohmann/json）
+#include <deque>
+#include <string>
+#include <iostream>
+//----------------------------------
 
 #include "externals/DirectXTex/DirectXTex.h"
 #include "externals/DirectXTex/d3dx12.h"
@@ -172,7 +185,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg,
 
 	// メッセージに応じてゲーム固有の処理を行う
 	switch (msg) {
-	// ウィンドウが破棄された
+		// ウィンドウが破棄された
 	case WM_DESTROY:
 		// OSに対して、アプリの終了を伝える
 		PostQuitMessage(0);
@@ -313,7 +326,7 @@ DirectX::ScratchImage LoadTexture(const std::string& filePath) {
 	return mipImages;
 }
 
-ID3D12Resource* CreateTextureResource(ID3D12Device* device, const DirectX::TexMetadata& metadata) 	{
+ID3D12Resource* CreateTextureResource(ID3D12Device* device, const DirectX::TexMetadata& metadata) {
 	// metadataを基にResourceの設定
 	D3D12_RESOURCE_DESC resourceDesc{};
 	resourceDesc.Width = UINT(metadata.width); // Textureの幅
@@ -360,7 +373,7 @@ ID3D12Resource* UploadTextureData(ID3D12Resource* texture, const DirectX::Scratc
 	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_GENERIC_READ;
 	commandList->ResourceBarrier(1, &barrier);
 	return intermediateResource;
-	
+
 	/*
 	// Meta情報を取得
 	const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
@@ -396,7 +409,7 @@ ID3D12Resource* CreateDepthStencilTextureResource(ID3D12Device* device, int32_t 
 	// 利用するHeapの設定。
 	D3D12_HEAP_PROPERTIES heapProperties{};
 	heapProperties.Type = D3D12_HEAP_TYPE_DEFAULT; // VRAM上に作る
-	
+
 	// 深度値のクリア設定
 	D3D12_CLEAR_VALUE depthClearValue{};
 	depthClearValue.DepthStencil.Depth = 1.0f; // 1.0f（最大値）でクリア
@@ -419,6 +432,11 @@ ID3D12Resource* CreateDepthStencilTextureResource(ID3D12Device* device, int32_t 
 /// TR1_LLM_SRPG用の設定
 ///----------------------------------------------------------------------------
 
+using json = nlohmann::json;
+
+std::deque<std::string> combat_log;
+constexpr size_t MAX_LOG_SIZE = 10;
+
 // ------------------------
 // マップとユニット情報
 // ------------------------
@@ -437,6 +455,12 @@ enum Phase {
 	EnemyTurn   // エネミーターン
 };
 Phase current_phase = PlayerTurn; // 現在のフェーズ(開始時はプレイヤーターン)
+
+// ユニットの武器タイプ
+enum class WeaponType {
+	Sword,      // 剣(近接)
+	Bow         // 弓(遠距離)
+};
 
 // マップの定義
 int map[MAP_SIZE][MAP_SIZE] = {
@@ -458,7 +482,7 @@ int map[MAP_SIZE][MAP_SIZE] = {
 	{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
 };
 
-// ユニット情報
+// ユニット情報(name, x, y, is_enemy, hp, move, has_move, has_attacked, atk, def, min_range, max_range)
 struct Unit {
 	std::string name;          // ユニット名
 	int x, y;                  // 位置
@@ -467,16 +491,24 @@ struct Unit {
 	int move = 3;              // 移動力
 	bool has_moved = false;    // 移動済みかどうか
 	bool has_attacked = false; // 攻撃済みかどうか
-	int min_range = 1;         // 最小攻撃範囲
-	int max_range = 1;         // 最大攻撃範囲
 	int atk = 5;               // 攻撃力
 	int def = 2;               // 防御力
+	WeaponType weapon = WeaponType::Sword; // 武器タイプ
+
+	// 最小攻撃範囲
+	int min_range() const {
+		return weapon == WeaponType::Sword ? 1 : 2;
+	}
+	// 最大攻撃範囲
+	int max_range() const {
+		return weapon == WeaponType::Sword ? 1 : 2;
+	}
 };
 
 // ユニットの初期化
 std::vector<Unit> units = {
-	{"ally1", 5, 5, false, 20, 3},  // 味方ユニット
-	{"enemy1", 10, 5, true, 15, 3}  // 敵ユニット
+	{"ally1", 5, 5, false, 20, 3, false, false, 5, 2, WeaponType::Sword},  // 味方ユニット
+	{"enemy1", 10, 5, true, 15, 3, false, false, 5, 2, WeaponType::Bow}  // 敵ユニット
 };
 
 int selected_unit_index = -1;  // 選択中のユニットインデックス
@@ -529,10 +561,10 @@ std::set<std::pair<int, int>> get_move_range(const Unit& unit) {
 // ユニットの攻撃範囲を計算する関数
 std::set<std::pair<int, int>> get_attack_range(const Unit& unit) {
 	std::set<std::pair<int, int>> result;
-	for (int dx = -unit.max_range; dx <= unit.max_range; ++dx) {
-		for (int dy = -unit.max_range; dy <= unit.max_range; ++dy) {
+	for (int dx = -unit.max_range(); dx <= unit.max_range(); ++dx) {
+		for (int dy = -unit.max_range(); dy <= unit.max_range(); ++dy) {
 			int dist = abs(dx) + abs(dy);
-			if (dist >= unit.min_range && dist <= unit.max_range) {
+			if (dist >= unit.min_range() && dist <= unit.max_range()) {
 				int tx = unit.x + dx;
 				int ty = unit.y + dy;
 				if (is_within_bounds(tx, ty)) {
@@ -544,16 +576,30 @@ std::set<std::pair<int, int>> get_attack_range(const Unit& unit) {
 	return result;
 }
 
+void log(const std::string& msg) {
+	combat_log.push_front(msg);
+	if (combat_log.size() > MAX_LOG_SIZE) combat_log.pop_back();
+}
+
 // ユニットを攻撃する関数
 void attack(Unit& attacker, Unit& target) {
 	int damage = std::max(0, attacker.atk - target.def);
 	target.hp -= damage;
+	log(attacker.name + " Attack! " + target.name + " Deals " + std::to_string(damage) + " Damage ");
+
+	if (target.hp <= 0) {
+		log(target.name + " Is Defeted ");
+		return;
+	}
+
 	// 反撃処理
 	if (target.hp > 0) {
 		auto counter_range = get_attack_range(target);
 		if (counter_range.count({ attacker.x, attacker.y })) {
 			int counter = std::max(0, target.atk - attacker.def);
 			attacker.hp -= counter;
+			log(target.name + " Counter! " + attacker.name + " Deals " + std::to_string(counter) + " Damage!! ");
+			if (attacker.hp <= 0) log(attacker.name + " Is Defeted ");
 		}
 	}
 }
@@ -569,20 +615,201 @@ void end_player_turn() {
 	current_phase = EnemyTurn;
 }
 
-// エネミーターンのロジック
-void enemy_turn_logic() {
-	for (auto& enemy : units) {
-		if (!enemy.is_enemy || enemy.hp <= 0) continue;
-		for (auto& target : units) {
-			if (target.is_enemy || target.hp <= 0) continue;
-			int dx = abs(enemy.x - target.x);
-			int dy = abs(enemy.y - target.y);
-			if (dx + dy == 1) {
-				attack(enemy, target);
-				break;
+// JSON形式でゲーム状態を構築する関数
+json build_game_state_json() {
+	json j;
+	j["allies"] = json::array();
+	j["enemies"] = json::array();
+	for (const auto& u : units) {
+		if (u.hp <= 0) continue;
+		json ent = {
+			{"id", u.name},
+			{"x", u.x},
+			{"y", u.y},
+			{"hp", u.hp},
+			{"atk", u.atk},
+			{"range", {u.min_range(), u.max_range()}}
+		};
+		if (u.is_enemy) j["enemies"].push_back(ent);
+		else j["allies"].push_back(ent);
+	}
+	return j;
+}
+
+// OllamaAIを呼び出す関数
+std::string call_ollama_ai(const json& state_json) {
+	// ai_input.json のパスを確定
+	std::string input_json_path = "ai_input.json";
+
+	std::ofstream temp_in(input_json_path);
+	if (!temp_in.is_open()) {
+		std::cerr << "Error: Could not open " << input_json_path << " for writing." << std::endl;
+		return "";
+	}
+	temp_in << state_json.dump();
+	temp_in.close();
+
+	// Pythonスクリプトへのパスを確定
+	std::string python_script_path = "ai_decision_ollama.py";
+
+	// コマンド文字列を構築
+	// 2>&1 は標準エラー出力を標準出力にリダイレクトする
+	// これにより、PythonスクリプトのDEBUG/ERRORログもC++で読み取れるようになる
+	std::string command = "type \"" + input_json_path + "\" | python \"" + python_script_path + "\" 2>&1";
+
+	std::cerr << "[C++ Debug] Executing command: " << command << std::endl;
+
+	// _popen を使用してコマンドを実行し、出力を読み込む
+	// "r" モードで開くと、子プロセスの標準出力と標準エラー出力を親プロセスが読み込める
+	FILE* pipe = _popen(command.c_str(), "r");
+	if (!pipe) {
+		std::cerr << "Error: Could not open pipe to Python script." << std::endl;
+		return "";
+	}
+
+	std::string line;
+	std::stringstream full_output_buffer;
+	std::stringstream json_output_buffer; // JSONの行だけを格納するバッファ
+
+	char buffer[256]; // 読み込みバッファを少し大きくする
+	while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+		line = buffer;
+		full_output_buffer << line; // すべての出力を格納
+
+		// Pythonスクリプトからのデバッグ/エラーログを識別してC++のstderrに出力
+		// "[DEBUG]" または "[ERROR]" で始まる行をチェック
+		if (line.rfind("[DEBUG]", 0) == 0 || line.rfind("[ERROR]", 0) == 0) {
+			// 改行が二重にならないようにtrimする
+			if (!line.empty() && line.back() == '\n') {
+				line.pop_back(); // 最後の改行を削除
 			}
+			std::cerr << "[Python stderr]: " << line << std::endl;
+		} else {
+			// それ以外の行（PythonのstdoutからのJSONを想定）をJSONバッファに貯める
+			json_output_buffer << line;
 		}
 	}
+	_pclose(pipe); // パイプを閉じる
+
+	std::cerr << "[C++ Debug] Full Python script output:\n" << full_output_buffer.str() << std::endl;
+
+	std::string json_result = json_output_buffer.str();
+	// 最終的なJSON文字列から余計な空白や改行をトリムする
+	// WindowsのバックスラッシュR(\r)も考慮
+	json_result.erase(json_result.find_last_not_of(" \n\r\t") + 1);
+
+	std::cerr << "[C++ Debug] JSON string to parse: [" << json_result << "]" << std::endl;
+
+	return json_result;
+}
+
+// AIの行動を適用する関数
+void apply_ai_actions(const std::string& json_result) {
+	try {
+		auto actions = json::parse(json_result); // JSONでの応答をパース
+		// actionsは{"unit": "unit_id", "action": "move/attack", "to": [x, y], "target": "target_id"}の形式
+		for (const auto& action : actions) {
+			std::string unit_id = action["unit"];
+			for (auto& u : units) {
+				if (u.name == unit_id && u.is_enemy && u.hp > 0) {
+					if (action["action"] == "move") {
+						u.x = action["to"][0];
+						u.y = action["to"][1];
+						log(unit_id + " moved to (" + std::to_string(u.x) + "," + std::to_string(u.y) + ")");
+					} else if (action["action"] == "attack") {
+						std::string target_id = action["target"];
+						for (auto& t : units) {
+							if (t.name == target_id && !t.is_enemy && t.hp > 0) {
+								attack(u, t);
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+	} catch (const json::parse_error& e) { // nlohmann::json のパースエラーを具体的に捕捉
+		std::cerr << "JSON parse error: " << e.what() << std::endl;
+		std::cerr << "Problematic JSON: [" << json_result << "]" << std::endl;
+	} catch (const json::exception& e) { // nlohmann::json のその他のエラーを捕捉
+		std::cerr << "JSON exception: " << e.what() << std::endl;
+		std::cerr << "Problematic JSON: [" << json_result << "]" << std::endl;
+	} catch (...) {
+		// エラー処理: 無効な応答なら無視
+		std::cerr << "An unknown error occurred while applying AI actions." << std::endl;
+		std::cerr << "Problematic JSON: [" << json_result << "]" << std::endl;
+	}
+	/*std::string result = call_ollama_ai(json_result);
+	if (result.empty()) {
+		std::cerr << "LLMの応答が空、またはai_output.jsonが読み取れませんでした" << std::endl;
+		return;
+	}*/
+}
+
+// エネミーターンのロジック
+void enemy_turn_logic() {
+	//for (auto& enemy : units) {
+	//	if (!enemy.is_enemy || enemy.hp <= 0) continue;
+
+	//	// 最も近いプレイヤーユニットを探す
+	//	int closest_dist = std::numeric_limits<int>::max();
+	//	Unit* target_unit = nullptr;
+
+	//	for (auto& ally : units) {
+	//		if (ally.is_enemy || ally.hp <= 0) continue;
+	//		int dist = std::abs(enemy.x - ally.x) + std::abs(enemy.y - ally.y);
+	//		if (dist < closest_dist) {
+	//			closest_dist = dist;
+	//			target_unit = &ally;
+	//		}
+	//	}
+
+	//	if (target_unit) {
+	//		// 射程内なら攻撃
+	//		int dx = std::abs(enemy.x - target_unit->x);
+	//		int dy = std::abs(enemy.y - target_unit->y);
+	//		int dist = dx + dy;
+	//		int min_r = enemy.min_range();
+	//		int max_r = enemy.max_range();
+	//		if (dist >= min_r && dist <= max_r) {
+	//			attack(enemy, *target_unit);
+	//			continue;
+	//		}
+
+	//		// 移動処理：1マスだけ近づく（シンプル実装）
+	//		int best_x = enemy.x, best_y = enemy.y;
+	//		int best_score = closest_dist;
+	//		const int dirs[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
+
+	//		for (auto& dir : dirs) {
+	//			int nx = enemy.x + dir[0];
+	//			int ny = enemy.y + dir[1];
+	//			if (!is_within_bounds(nx, ny)) continue;
+	//			if (!is_tile_passable(nx, ny) || is_occupied(nx, ny)) continue;
+	//			int score = std::abs(nx - target_unit->x) + std::abs(ny - target_unit->y);
+	//			if (score < best_score) {
+	//				best_score = score;
+	//				best_x = nx;
+	//				best_y = ny;
+	//			}
+	//		}
+	//		enemy.x = best_x;
+	//		enemy.y = best_y;
+
+	//		// 再度攻撃可能か確認
+	//		dx = std::abs(enemy.x - target_unit->x);
+	//		dy = std::abs(enemy.y - target_unit->y);
+	//		dist = dx + dy;
+	//		if (dist >= min_r && dist <= max_r) {
+	//			attack(enemy, *target_unit);
+	//		}
+	//	}
+	//}
+	
+	json game_state = build_game_state_json();
+	std::string result = call_ollama_ai(game_state);
+	apply_ai_actions(result);
+
 	for (auto& u : units) u.has_moved = u.has_attacked = false;
 	current_phase = PlayerTurn;
 }
@@ -625,23 +852,25 @@ void RenderMapWithUnits() {
 	if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0)) {
 		int mx = (int)((mouse.x - origin.x) / TILE_SIZE);
 		int my = (int)((mouse.y - origin.y) / TILE_SIZE);
-		
+
 		// 既にユニットが選択されていて、移動範囲内なら移動処理
 		if (selected_unit_index >= 0 && selected_unit_index < (int)units.size()) {
 			auto& u = units[selected_unit_index];
-			if (!u.has_moved && current_move_range.count({ mx, my }) && !is_occupied(mx, my)) {
-				u.x = mx;
-				u.y = my;
-				u.has_moved = true;
-				current_move_range.clear();
-				current_attack_range = get_attack_range(u);
-			} else if (!u.has_attacked && current_attack_range.count({ mx, my })) {
-				// 攻撃処理
-				for (auto& target : units) {
-					if (target.is_enemy && target.hp > 0 && target.x == mx && target.y == my) {
-						attack(u, target);
-						u.has_attacked = true;
-						break;
+			if (u.hp > 0) {
+				if (!u.has_moved && current_move_range.count({ mx, my }) && !is_occupied(mx, my)) {
+					u.x = mx;
+					u.y = my;
+					u.has_moved = true;
+					current_move_range.clear();
+					current_attack_range = get_attack_range(u);
+				} else if (!u.has_attacked && current_attack_range.count({ mx, my })) {
+					// 攻撃処理
+					for (auto& target : units) {
+						if (target.is_enemy && target.hp > 0 && target.x == mx && target.y == my) {
+							attack(u, target);
+							u.has_attacked = true;
+							break;
+						}
 					}
 				}
 			}
@@ -649,7 +878,7 @@ void RenderMapWithUnits() {
 
 		// ユニット選択
 		for (size_t i = 0; i < units.size(); ++i) {
-			if (units[i].x == mx && units[i].y == my && !units[i].is_enemy) {
+			if (units[i].x == mx && units[i].y == my && !units[i].is_enemy && units[i].hp > 0) {
 				selected_unit_index = (int)i;
 				current_move_range = get_move_range(units[i]);
 			}
@@ -665,12 +894,16 @@ void RenderUnitPanel() {
 	ImGui::Begin("Unit Info");
 	if (selected_unit_index >= 0 && selected_unit_index < (int)units.size()) {
 		auto& u = units[selected_unit_index];
-		ImGui::Text("%s", u.name.c_str());
-		ImGui::Text("Position: (%d, %d)", u.x, u.y);
-		ImGui::Text("HP: %d", u.hp);
-		ImGui::Text("ATK: %d / DEF: %d", u.atk, u.def);
-		ImGui::Text("Moved: %s", u.has_moved ? "Yes" : "No");
-		ImGui::Text("Attacked: %s", u.has_attacked ? "Yes" : "No");
+		if (u.hp > 0) {
+			ImGui::Text("%s", u.name.c_str());
+			ImGui::Text("Position: (%d, %d)", u.x, u.y);
+			ImGui::Text("HP: %d", u.hp);
+			ImGui::Text("ATK: %d / DEF: %d", u.atk, u.def);
+			ImGui::Text("Moved: %s", u.has_moved ? "Yes" : "No");
+			ImGui::Text("Attacked: %s", u.has_attacked ? "Yes" : "No");
+		} else {
+			ImGui::Text("[Unit Is Defeted] %s", u.name.c_str());
+		}
 	} else {
 		ImGui::Text("Please Select");
 	}
@@ -680,11 +913,40 @@ void RenderUnitPanel() {
 	ImGui::End();
 }
 
+// 戦闘ログを描画する関数
+void RenderCombatLog() {
+	ImGui::Begin("CombatLog");
+	for (const auto& entry : combat_log) {
+		ImGui::TextWrapped("%s", entry.c_str());
+	}
+	ImGui::End();
+}
+
+// 出力ヘルパー関数
+void DebugOutput(const std::string& s) {
+	OutputDebugStringA(s.c_str());
+}
+
 // UIを描画する関数
 void RenderUI() {
 	if (current_phase == EnemyTurn) enemy_turn_logic();
 	RenderMapWithUnits();
 	RenderUnitPanel();
+	RenderCombatLog();
+
+	json j = build_game_state_json();
+	std::ostringstream oss;
+
+	// JSON出力
+	oss << "[DEBUG] JSON = " << j.dump(2) << "\n";
+
+	// ユニット情報出力
+	for (const auto& u : units) {
+		oss << "[UNIT] " << u.name << " HP: " << u.hp << " Pos: " << u.x << "," << u.y << "\n";
+	}
+
+	// まとめてデバッグ出力
+	//DebugOutput(oss.str());
 }
 
 ///----------------------------------------------------------------------------
@@ -878,7 +1140,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	hr = dxgiFactory->CreateSwapChainForHwnd(commandQueue, hwnd, &swapChainDesc, nullptr, nullptr, reinterpret_cast<IDXGISwapChain1**>(&swapChain));
 	assert(SUCCEEDED(hr));
 
-	
+
 
 	// RTV用のヒープでディスクリプタの数は2。RTVはShader内で触るものではないので、ShaderVisubleはfalse
 	ID3D12DescriptorHeap* rtvDescriptorHeap = CreateDescriptorHeap(device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2, false);
@@ -912,7 +1174,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	// ２つ目を作る
 	device->CreateRenderTargetView(swapChainResources[1], &rtvDesc, rtvHandles[1]);
 
-	
+
 	// 初期値０でFenceを作る
 	ID3D12Fence* fence = nullptr;
 	uint64_t fenceValue = 0;
@@ -937,7 +1199,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	hr = dxcUtils->CreateDefaultIncludeHandler(&includeHandler);
 	assert(SUCCEEDED(hr));
 
-	
+
 	// RootSignature作成
 	D3D12_ROOT_SIGNATURE_DESC descriptionRootSignature{};
 	descriptionRootSignature.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -1017,7 +1279,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	rasterizerDesc.FillMode = D3D12_FILL_MODE_SOLID;
 
 	// Shaderをコンパイルする
-	IDxcBlob* vertexShaderBlob = CompileShader(L"Object3D.VS.hlsl",	L"vs_6_0", dxcUtils, dxcCompiler, includeHandler);
+	IDxcBlob* vertexShaderBlob = CompileShader(L"Object3D.VS.hlsl", L"vs_6_0", dxcUtils, dxcCompiler, includeHandler);
 	assert(vertexShaderBlob != nullptr);
 
 	IDxcBlob* pixelShaderBlob = CompileShader(L"Object3D.PS.hlsl", L"ps_6_0", dxcUtils, dxcCompiler, includeHandler);
@@ -1039,7 +1301,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	// どのように画面に色を打ち込むかの設定（気にしなくていい）
 	graphicsPipelineStateDesc.SampleDesc.Count = 1;
 	graphicsPipelineStateDesc.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
-	
+
 	// DepthStencilStateの設定
 	D3D12_DEPTH_STENCIL_DESC depthStencilDesc{};
 	// Depthの機能を有効化する
@@ -1058,7 +1320,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	hr = device->CreateGraphicsPipelineState(&graphicsPipelineStateDesc, IID_PPV_ARGS(&graphicsPipelineState));
 	assert(SUCCEEDED(hr));
 
-	
+
 	// 実際に頂点リソースを作る
 	ID3D12Resource* vertexResource = CreateBufferResource(device, sizeof(VertexData) * 6);
 
@@ -1140,7 +1402,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	DirectX::ScratchImage mipImages = LoadTexture("resources/uvChecker.png");
 	const DirectX::TexMetadata& metadata = mipImages.GetMetadata();
 	ID3D12Resource* textureResource = CreateTextureResource(device, metadata);
-	
+
 	ID3D12Resource* depthStencilResource = CreateDepthStencilTextureResource(device, kClientWidth, kClientWidth);
 
 	ID3D12Resource* intermediateResource = UploadTextureData(textureResource, mipImages, device, commandList);
@@ -1148,7 +1410,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 	commandList->Close();
 	ID3D12CommandList* commandLists[] = { commandList };
 	commandQueue->ExecuteCommandLists(_countof(commandLists), commandLists);
-    
+
 	// 実行を待つ
 	fenceValue++;
 	commandQueue->Signal(fence, fenceValue);
@@ -1157,11 +1419,11 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 		WaitForSingleObject(fenceEvent, INFINITE);
 	}
 
-    // 実行が完了したので、allcatorとcommandListをresetして次のコマンドを積めるようにする
+	// 実行が完了したので、allcatorとcommandListをresetして次のコマンドを積めるようにする
 	commandAllocator->Reset();
 	commandList->Reset(commandAllocator, nullptr);
 
-    // ここまできたら転送は終わっているので、intermediateResourceはReleaseしても良い
+	// ここまできたら転送は終わっているので、intermediateResourceはReleaseしても良い
 	intermediateResource->Release();
 
 
@@ -1190,20 +1452,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 
 	// ImGuiの初期化。詳細はさして重要ではないので省略する。
-    // こういうもんである
+	// こういうもんである
 	IMGUI_CHECKVERSION();
 	ImGui::CreateContext();
 	ImGui::StyleColorsDark();
 	ImGui_ImplWin32_Init(hwnd);
 	ImGui_ImplDX12_Init(device,
 		swapChainDesc.BufferCount,
-		rtvDesc.Format, 
+		rtvDesc.Format,
 		srvDescriptorHeap,
-		srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(), 
+		srvDescriptorHeap->GetCPUDescriptorHandleForHeapStart(),
 		srvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
 
-	
-	
+
+
 
 
 	MSG msg{};
@@ -1223,8 +1485,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			//ImGui::ShowDemoWindow();
 
 			///----------------------------------------------------------------------------
-            /// TR1_LLM_SRPG用の設定
-            ///----------------------------------------------------------------------------
+			/// TR1_LLM_SRPG用の設定
+			///----------------------------------------------------------------------------
 
 			RenderUI();
 
@@ -1232,7 +1494,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 			// ゲームの処理-----------------------------------------------------------------------------------
 
-			
+
 
 			Transform cameraTransform = { { 1.0f, 1.0f, 1.0f }, { 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, -5.0f } };
 			Matrix4x4 worldMatrix = MakeAffineMatrix(transform.scale, transform.rotate, transform.translate);
@@ -1251,7 +1513,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 			// これから書き込むバックバッファのインデックスを取得
 			UINT backBufferIndex = swapChain->GetCurrentBackBufferIndex();
-			
+
 			// TransitionBarrierの設定
 			D3D12_RESOURCE_BARRIER barrier{};
 			// 今回のバリアはTransition
@@ -1266,7 +1528,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			// TransitionBarrierを張る
 			commandList->ResourceBarrier(1, &barrier);
-			
+
 			// 描画先のRTSとDSVを設定する
 			D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = dsvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
 			commandList->OMSetRenderTargets(1, &rtvHandles[backBufferIndex], false, &dsvHandle);
@@ -1299,10 +1561,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
 
 			// 描画！（DrawCall/ドローコール）。３頂点で１つのインスタンス。インスタンスについては今後
-			commandList->DrawInstanced(6, 1, 0, 0);
+			//commandList->DrawInstanced(6, 1, 0, 0);
 
 			//ここまで-ImGui_ImplDX12_Init()--------------------------------------------------------------------------------------
-			
+
 			// 実際のcommandListのImGuiの描画コマンドを積む
 			ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
 
@@ -1312,7 +1574,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 			// TransitionBarrierを張る
 			commandList->ResourceBarrier(1, &barrier);
-			
+
 			// コマンドリストの内容を確定させる。すべてのコマンドを積んでからCloseすること
 			hr = commandList->Close();
 			assert(SUCCEEDED(hr));
