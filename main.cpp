@@ -16,10 +16,13 @@
 #include <dxcapi.h>
 #include <vector>
 
+// SRPG用--------------------------
 #include <cmath>
 #include <queue>
 #include <set>
 #include <tuple>
+#include <limits>
+//---------------------------------
 
 #include "externals/DirectXTex/DirectXTex.h"
 #include "externals/DirectXTex/d3dx12.h"
@@ -419,6 +422,9 @@ ID3D12Resource* CreateDepthStencilTextureResource(ID3D12Device* device, int32_t 
 /// TR1_LLM_SRPG用の設定
 ///----------------------------------------------------------------------------
 
+std::deque<std::string> combat_log;
+constexpr size_t MAX_LOG_SIZE = 10;
+
 // ------------------------
 // マップとユニット情報
 // ------------------------
@@ -437,6 +443,12 @@ enum Phase {
 	EnemyTurn   // エネミーターン
 };
 Phase current_phase = PlayerTurn; // 現在のフェーズ(開始時はプレイヤーターン)
+
+// ユニットの武器タイプ
+enum class WeaponType {
+	Sword,      // 剣(近接)
+	Bow         // 弓(遠距離)
+};
 
 // マップの定義
 int map[MAP_SIZE][MAP_SIZE] = {
@@ -467,16 +479,25 @@ struct Unit {
 	int move = 3;              // 移動力
 	bool has_moved = false;    // 移動済みかどうか
 	bool has_attacked = false; // 攻撃済みかどうか
-	int min_range = 1;         // 最小攻撃範囲
-	int max_range = 1;         // 最大攻撃範囲
 	int atk = 5;               // 攻撃力
 	int def = 2;               // 防御力
+
+	WeaponType weapon = WeaponType::Sword; // 武器タイプ
+
+	// 最小攻撃範囲
+	int min_range() const {
+		return weapon == WeaponType::Sword ? 1 : 2;
+	}
+	// 最大攻撃範囲
+	int max_range() const {
+		return weapon == WeaponType::Sword ? 1 : 2;
+	}
 };
 
 // ユニットの初期化
 std::vector<Unit> units = {
-	{"ally1", 5, 5, false, 20, 3},  // 味方ユニット
-	{"enemy1", 10, 5, true, 15, 3}  // 敵ユニット
+	{"ally1", 5, 5, false, 20, 3, false, false, 5, 2, WeaponType::Sword},  // 味方ユニット
+	{"enemy1", 10, 5, true, 15, 3, false, false, 5, 2, WeaponType::Bow}  // 敵ユニット
 };
 
 int selected_unit_index = -1;  // 選択中のユニットインデックス
@@ -529,10 +550,10 @@ std::set<std::pair<int, int>> get_move_range(const Unit& unit) {
 // ユニットの攻撃範囲を計算する関数
 std::set<std::pair<int, int>> get_attack_range(const Unit& unit) {
 	std::set<std::pair<int, int>> result;
-	for (int dx = -unit.max_range; dx <= unit.max_range; ++dx) {
-		for (int dy = -unit.max_range; dy <= unit.max_range; ++dy) {
+	for (int dx = -unit.max_range(); dx <= unit.max_range(); ++dx) {
+		for (int dy = -unit.max_range(); dy <= unit.max_range(); ++dy) {
 			int dist = abs(dx) + abs(dy);
-			if (dist >= unit.min_range && dist <= unit.max_range) {
+			if (dist >= unit.min_range() && dist <= unit.max_range()) {
 				int tx = unit.x + dx;
 				int ty = unit.y + dy;
 				if (is_within_bounds(tx, ty)) {
@@ -544,16 +565,30 @@ std::set<std::pair<int, int>> get_attack_range(const Unit& unit) {
 	return result;
 }
 
+void log(const std::string& msg) {
+	combat_log.push_front(msg);
+	if (combat_log.size() > MAX_LOG_SIZE) combat_log.pop_back();
+}
+
 // ユニットを攻撃する関数
 void attack(Unit& attacker, Unit& target) {
 	int damage = std::max(0, attacker.atk - target.def);
 	target.hp -= damage;
+	log(attacker.name + " Attack! " + target.name + " Deals " + std::to_string(damage) + " Damage ");
+
+	if (target.hp <= 0) {
+		log(target.name + " Is Defeted ");
+		return;
+	}
+
 	// 反撃処理
 	if (target.hp > 0) {
 		auto counter_range = get_attack_range(target);
 		if (counter_range.count({ attacker.x, attacker.y })) {
 			int counter = std::max(0, target.atk - attacker.def);
 			attacker.hp -= counter;
+			log(target.name + " Counter! " + attacker.name + " Deals " + std::to_string(counter) + " Damage!! ");
+			if (attacker.hp <= 0) log(attacker.name + " Is Defeted ");
 		}
 	}
 }
@@ -573,13 +608,99 @@ void end_player_turn() {
 void enemy_turn_logic() {
 	for (auto& enemy : units) {
 		if (!enemy.is_enemy || enemy.hp <= 0) continue;
-		for (auto& target : units) {
-			if (target.is_enemy || target.hp <= 0) continue;
-			int dx = abs(enemy.x - target.x);
-			int dy = abs(enemy.y - target.y);
-			if (dx + dy == 1) {
-				attack(enemy, target);
-				break;
+
+		// 最も近いプレイヤーユニットを探す
+		int closest_dist = std::numeric_limits<int>::max();
+		Unit* target_unit = nullptr;
+
+		for (auto& ally : units) {
+			if (ally.is_enemy || ally.hp <= 0) continue;
+			int dist = std::abs(enemy.x - ally.x) + std::abs(enemy.y - ally.y);
+			if (dist < closest_dist) {
+				closest_dist = dist;
+				target_unit = &ally;
+			}
+		}
+
+		if (target_unit) {
+			// 射程内なら攻撃
+			int dx = std::abs(enemy.x - target_unit->x);
+			int dy = std::abs(enemy.y - target_unit->y);
+			int dist = dx + dy;
+			int min_r = enemy.min_range();
+			int max_r = enemy.max_range();
+			if (dist >= min_r && dist <= max_r) {
+				attack(enemy, *target_unit);
+				continue;
+			}
+
+			
+		 // 移動可能なマスを全て洗い出す
+			std::set<std::pair<int, int>> possible_moves = get_move_range(enemy);
+
+			int best_move_x = enemy.x;
+			int best_move_y = enemy.y;
+			Unit* best_attack_target = nullptr; // 移動後に攻撃するターゲット
+			int max_potential_damage = -1; // 移動後に与えられる最大ダメージ
+
+			// 移動先の候補地を評価
+			for (const auto& move_pos : possible_moves) {
+				// 移動後の位置から攻撃できる敵を探す
+				// 注意: ここでenemyのx,yを一時的に変更してget_attack_rangeを呼ぶか、
+				// get_attack_rangeに引数として位置を渡せるように変更する必要がある
+				// 今回は簡略化のため、直接マンハッタン距離で判定
+
+				for (auto& ally : units) {
+					if (ally.is_enemy || ally.hp <= 0) continue;
+
+					int new_dx = std::abs(move_pos.first - ally.x);
+					int new_dy = std::abs(move_pos.second - ally.y);
+					int new_dist = new_dx + new_dy;
+
+					if (new_dist >= min_r && new_dist <= max_r) {
+						// 攻撃可能なターゲットが見つかった場合
+						int current_potential_damage = std::max(0, enemy.atk - ally.def);
+						if (current_potential_damage > max_potential_damage) {
+							max_potential_damage = current_potential_damage;
+							best_move_x = move_pos.first;
+							best_move_y = move_pos.second;
+							best_attack_target = &ally; // このターゲットを攻撃する
+						}
+					}
+				}
+			}
+
+			// 最適な移動と攻撃を実行
+			if (best_attack_target && max_potential_damage > 0) { // 攻撃可能なユニットが見つかった場合
+				enemy.x = best_move_x;
+				enemy.y = best_move_y;
+				attack(enemy, *best_attack_target);
+			} else {
+				// 攻撃可能な場所が見つからなかった場合、ターゲットに近づく (既存のロジックを改良)
+				// 例えば、ターゲットまでの距離が最も短くなる1マス移動先を探す
+				int current_dist_to_target = std::abs(enemy.x - target_unit->x) + std::abs(enemy.y - target_unit->y);
+				int best_approach_x = enemy.x;
+				int best_approach_y = enemy.y;
+
+				const int dirs[4][2] = { {1,0}, {-1,0}, {0,1}, {0,-1} };
+
+				for (auto& dir : dirs) {
+					int nx = enemy.x + dir[0];
+					int ny = enemy.y + dir[1];
+					if (!is_within_bounds(nx, ny)) continue;
+					// 敵ユニットの移動では、他のユニットが占拠していても通過できる（隣接マスへの移動のみ）
+					// is_occupiedチェックは不要かもしれないが、ここでは残す
+					if (!is_tile_passable(nx, ny) || is_occupied(nx, ny)) continue;
+
+					int new_dist_to_target = std::abs(nx - target_unit->x) + std::abs(ny - target_unit->y);
+					if (new_dist_to_target < current_dist_to_target) {
+						current_dist_to_target = new_dist_to_target;
+						best_approach_x = nx;
+						best_approach_y = ny;
+					}
+				}
+				enemy.x = best_approach_x;
+				enemy.y = best_approach_y;
 			}
 		}
 	}
@@ -629,19 +750,21 @@ void RenderMapWithUnits() {
 		// 既にユニットが選択されていて、移動範囲内なら移動処理
 		if (selected_unit_index >= 0 && selected_unit_index < (int)units.size()) {
 			auto& u = units[selected_unit_index];
-			if (!u.has_moved && current_move_range.count({ mx, my }) && !is_occupied(mx, my)) {
-				u.x = mx;
-				u.y = my;
-				u.has_moved = true;
-				current_move_range.clear();
-				current_attack_range = get_attack_range(u);
-			} else if (!u.has_attacked && current_attack_range.count({ mx, my })) {
-				// 攻撃処理
-				for (auto& target : units) {
-					if (target.is_enemy && target.hp > 0 && target.x == mx && target.y == my) {
-						attack(u, target);
-						u.has_attacked = true;
-						break;
+			if (u.hp > 0) {
+				if (!u.has_moved && current_move_range.count({ mx, my }) && !is_occupied(mx, my)) {
+					u.x = mx;
+					u.y = my;
+					u.has_moved = true;
+					current_move_range.clear();
+					current_attack_range = get_attack_range(u);
+				} else if (!u.has_attacked && current_attack_range.count({ mx, my })) {
+					// 攻撃処理
+					for (auto& target : units) {
+						if (target.is_enemy && target.hp > 0 && target.x == mx && target.y == my) {
+							attack(u, target);
+							u.has_attacked = true;
+							break;
+						}
 					}
 				}
 			}
@@ -649,7 +772,7 @@ void RenderMapWithUnits() {
 
 		// ユニット選択
 		for (size_t i = 0; i < units.size(); ++i) {
-			if (units[i].x == mx && units[i].y == my && !units[i].is_enemy) {
+			if (units[i].x == mx && units[i].y == my && !units[i].is_enemy && units[i].hp > 0) {
 				selected_unit_index = (int)i;
 				current_move_range = get_move_range(units[i]);
 			}
@@ -665,12 +788,16 @@ void RenderUnitPanel() {
 	ImGui::Begin("Unit Info");
 	if (selected_unit_index >= 0 && selected_unit_index < (int)units.size()) {
 		auto& u = units[selected_unit_index];
-		ImGui::Text("%s", u.name.c_str());
-		ImGui::Text("Position: (%d, %d)", u.x, u.y);
-		ImGui::Text("HP: %d", u.hp);
-		ImGui::Text("ATK: %d / DEF: %d", u.atk, u.def);
-		ImGui::Text("Moved: %s", u.has_moved ? "Yes" : "No");
-		ImGui::Text("Attacked: %s", u.has_attacked ? "Yes" : "No");
+		if (u.hp > 0) {
+			ImGui::Text("%s", u.name.c_str());
+			ImGui::Text("Position: (%d, %d)", u.x, u.y);
+			ImGui::Text("HP: %d", u.hp);
+			ImGui::Text("ATK: %d / DEF: %d", u.atk, u.def);
+			ImGui::Text("Moved: %s", u.has_moved ? "Yes" : "No");
+			ImGui::Text("Attacked: %s", u.has_attacked ? "Yes" : "No");
+		} else {
+			ImGui::Text("[Unit Is Defeted] %s", u.name.c_str());
+		}
 	} else {
 		ImGui::Text("Please Select");
 	}
@@ -680,11 +807,21 @@ void RenderUnitPanel() {
 	ImGui::End();
 }
 
+// 戦闘ログを描画する関数
+void RenderCombatLog() {
+	ImGui::Begin("CombatLog");
+	for (const auto& entry : combat_log) {
+		ImGui::TextWrapped("%s", entry.c_str());
+	}
+	ImGui::End();
+}
+
 // UIを描画する関数
 void RenderUI() {
 	if (current_phase == EnemyTurn) enemy_turn_logic();
 	RenderMapWithUnits();
 	RenderUnitPanel();
+	RenderCombatLog();
 }
 
 ///----------------------------------------------------------------------------
